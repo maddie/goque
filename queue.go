@@ -4,17 +4,18 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/json"
+	"fmt"
 	"os"
 	"sync"
 
-	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/dgraph-io/badger/v3"
 )
 
 // Queue is a standard FIFO (first in, first out) queue.
 type Queue struct {
 	sync.RWMutex
 	DataDir string
-	db      *leveldb.DB
+	db      *badger.DB
 	head    uint64
 	tail    uint64
 	isOpen  bool
@@ -28,20 +29,57 @@ func OpenQueue(dataDir string) (*Queue, error) {
 	// Create a new Queue.
 	q := &Queue{
 		DataDir: dataDir,
-		db:      &leveldb.DB{},
+		db:      &badger.DB{},
 		head:    0,
 		tail:    0,
 		isOpen:  false,
 	}
 
 	// Open database for the queue.
-	q.db, err = leveldb.OpenFile(dataDir, nil)
+	opt := badger.DefaultOptions(dataDir)
+	opt = opt.WithValueLogFileSize(1 << 24)
+
+	q.db, err = badger.Open(opt)
 	if err != nil {
 		return q, err
 	}
 
 	// Check if this Goque type can open the requested data directory.
 	ok, err := checkGoqueType(dataDir, goqueQueue)
+	if err != nil {
+		return q, err
+	}
+	if !ok {
+		return q, ErrIncompatibleType
+	}
+
+	// Set isOpen and return.
+	q.isOpen = true
+	return q, q.init()
+}
+
+// OpenQueueWithOptions opens a queue with given BadgerDB options at the directory
+// defined within the options. If one does not already exist, a new queue is created.
+func OpenQueueWithOptions(options badger.Options) (*Queue, error) {
+	var err error
+
+	// Create a new Queue.
+	q := &Queue{
+		DataDir: options.Dir,
+		db:      &badger.DB{},
+		head:    0,
+		tail:    0,
+		isOpen:  false,
+	}
+
+	// Open database for the queue.
+	q.db, err = badger.Open(options)
+	if err != nil {
+		return q, err
+	}
+
+	// Check if this Goque type can open the requested data directory.
+	ok, err := checkGoqueType(options.Dir, goqueQueue)
 	if err != nil {
 		return q, err
 	}
@@ -72,7 +110,10 @@ func (q *Queue) Enqueue(value []byte) (*Item, error) {
 	}
 
 	// Add it to the queue.
-	if err := q.db.Put(item.Key, item.Value, nil); err != nil {
+	if err := q.db.Update(func(txn *badger.Txn) error {
+		err := txn.Set(item.Key, item.Value)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 
@@ -137,7 +178,9 @@ func (q *Queue) Dequeue() (*Item, error) {
 	}
 
 	// Remove this item from the queue.
-	if err := q.db.Delete(item.Key, nil); err != nil {
+	if err := q.db.Update(func(txn *badger.Txn) error {
+		return txn.Delete(item.Key)
+	}); err != nil {
 		return nil, err
 	}
 
@@ -210,7 +253,9 @@ func (q *Queue) Update(id uint64, newValue []byte) (*Item, error) {
 	}
 
 	// Update this item in the queue.
-	if err := q.db.Put(item.Key, item.Value, nil); err != nil {
+	if err := q.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(item.Key, item.Value)
+	}); err != nil {
 		return nil, err
 	}
 
@@ -259,7 +304,7 @@ func (q *Queue) Length() uint64 {
 	return q.tail - q.head
 }
 
-// Close closes the LevelDB database of the queue.
+// Close closes the BadgerDB database of the queue.
 func (q *Queue) Close() error {
 	q.Lock()
 	defer q.Unlock()
@@ -269,7 +314,7 @@ func (q *Queue) Close() error {
 		return nil
 	}
 
-	// Close the LevelDB database.
+	// Close the BadgerDB database.
 	if err := q.db.Close(); err != nil {
 		return err
 	}
@@ -283,13 +328,18 @@ func (q *Queue) Close() error {
 	return nil
 }
 
-// Drop closes and deletes the LevelDB database of the queue.
+// Drop closes and deletes the BadgerDB database of the queue.
 func (q *Queue) Drop() error {
 	if err := q.Close(); err != nil {
 		return err
 	}
 
 	return os.RemoveAll(q.DataDir)
+}
+
+// RunGC runs garbage collection on database and discard deleleted data from value log
+func (q *Queue) RunGC(discardRatio float64) error {
+	return q.db.RunValueLogGC(discardRatio)
 }
 
 // getItemByID returns an item, if found, for the given ID.
@@ -304,7 +354,20 @@ func (q *Queue) getItemByID(id uint64) (*Item, error) {
 	// Get item from database.
 	var err error
 	item := &Item{ID: id, Key: idToKey(id)}
-	if item.Value, err = q.db.Get(item.Key, nil); err != nil {
+	if err = q.db.View(func(txn *badger.Txn) error {
+		badgerItem, err := txn.Get(item.Key)
+		if err != nil {
+			return err
+		}
+
+		if returnedValue, err := badgerItem.ValueCopy(nil); err != nil {
+			return err
+		} else {
+			item.Value = returnedValue
+		}
+
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 
@@ -313,19 +376,35 @@ func (q *Queue) getItemByID(id uint64) (*Item, error) {
 
 // init initializes the queue data.
 func (q *Queue) init() error {
-	// Create a new LevelDB Iterator.
-	iter := q.db.NewIterator(nil, nil)
-	defer iter.Release()
+	return q.db.View(func(txn *badger.Txn) error {
+		// Create a new BadgerDB Iterator.
+		opts := badger.DefaultIteratorOptions
+		it := txn.NewIterator(opts)
+		defer it.Close()
 
-	// Set queue head to the first item.
-	if iter.First() {
-		q.head = keyToID(iter.Key()) - 1
-	}
+		if it.Rewind(); it.Valid() {
+			// Set queue head to the first item.
+			q.head = keyToID(it.Item().Key()) - 1
 
-	// Set queue tail to the last item.
-	if iter.Last() {
-		q.tail = keyToID(iter.Key())
-	}
+			for {
+				if it.Next(); it.Valid() {
+					// Set queue tail to the last item.
+					q.tail = keyToID(it.Item().Key())
+				} else {
+					break
+				}
+			}
+		}
 
-	return iter.Error()
+		// reinitialize queue in case of database error
+		if q.head > q.tail {
+			q.head = 0
+			q.tail = 0
+			if err := q.db.DropAll(); err != nil {
+				fmt.Printf("error resetting database: %s", err)
+			}
+		}
+
+		return nil
+	})
 }

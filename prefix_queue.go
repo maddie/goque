@@ -8,12 +8,11 @@ import (
 	"os"
 	"sync"
 
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/errors"
+	"github.com/dgraph-io/badger/v3"
 )
 
 // prefixDelimiter defines the delimiter used to separate a prefix from an
-// item ID within the LevelDB database. We use the lowest possible value for
+// item ID within the BadgerDB database. We use the lowest possible value for
 // a single byte, 0x00 (null), as the delimiter.
 const prefixDelimiter byte = '\x00'
 
@@ -33,7 +32,7 @@ func (q *queue) Length() uint64 {
 type PrefixQueue struct {
 	sync.RWMutex
 	DataDir string
-	db      *leveldb.DB
+	db      *badger.DB
 	size    uint64
 	isOpen  bool
 }
@@ -46,18 +45,54 @@ func OpenPrefixQueue(dataDir string) (*PrefixQueue, error) {
 	// Create a new Queue.
 	pq := &PrefixQueue{
 		DataDir: dataDir,
-		db:      &leveldb.DB{},
+		db:      &badger.DB{},
 		isOpen:  false,
 	}
 
 	// Open database for the prefix queue.
-	pq.db, err = leveldb.OpenFile(dataDir, nil)
+	opt := badger.DefaultOptions(dataDir)
+	opt = opt.WithValueLogFileSize(1 << 24)
+
+	pq.db, err = badger.Open(opt)
 	if err != nil {
 		return nil, err
 	}
 
 	// Check if this Goque type can open the requested data directory.
 	ok, err := checkGoqueType(dataDir, goquePrefixQueue)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, ErrIncompatibleType
+	}
+
+	// Set isOpen and return.
+	pq.isOpen = true
+	return pq, pq.init()
+}
+
+// OpenPrefixQueueWithOptions opens a prefix queue with given BadgerDB options at
+// the directory defined within the options. If one does not already exist,
+// a new prefix queue is created.
+func OpenPrefixQueueWithOptions(options badger.Options) (*PrefixQueue, error) {
+	var err error
+
+	// Create a new Queue.
+	pq := &PrefixQueue{
+		DataDir: options.Dir,
+		db:      &badger.DB{},
+		isOpen:  false,
+	}
+
+	// Open database for the prefix queue.
+	pq.db, err = badger.Open(options)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if this Goque type can open the requested data directory.
+	ok, err := checkGoqueType(options.Dir, goquePrefixQueue)
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +129,10 @@ func (pq *PrefixQueue) Enqueue(prefix, value []byte) (*Item, error) {
 	}
 
 	// Add it to the queue.
-	if err := pq.db.Put(item.Key, item.Value, nil); err != nil {
+	if err := pq.db.Update(func(txn *badger.Txn) error {
+		err := txn.Set(item.Key, item.Value)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 
@@ -176,7 +214,9 @@ func (pq *PrefixQueue) Dequeue(prefix []byte) (*Item, error) {
 	}
 
 	// Remove this item from the queue.
-	if err := pq.db.Delete(item.Key, nil); err != nil {
+	if err := pq.db.Update(func(txn *badger.Txn) error {
+		return txn.Delete(item.Key)
+	}); err != nil {
 		return nil, err
 	}
 
@@ -276,7 +316,9 @@ func (pq *PrefixQueue) Update(prefix []byte, id uint64, newValue []byte) (*Item,
 	}
 
 	// Update this item in the queue.
-	if err := pq.db.Put(item.Key, item.Value, nil); err != nil {
+	if err := pq.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(item.Key, item.Value)
+	}); err != nil {
 		return nil, err
 	}
 
@@ -325,7 +367,7 @@ func (pq *PrefixQueue) Length() uint64 {
 	return pq.size
 }
 
-// Close closes the LevelDB database of the prefix queue.
+// Close closes the BadgerDB database of the prefix queue.
 func (pq *PrefixQueue) Close() error {
 	pq.Lock()
 	defer pq.Unlock()
@@ -335,7 +377,7 @@ func (pq *PrefixQueue) Close() error {
 		return nil
 	}
 
-	// Close the LevelDB database.
+	// Close the BadgerDB database.
 	if err := pq.db.Close(); err != nil {
 		return err
 	}
@@ -347,7 +389,7 @@ func (pq *PrefixQueue) Close() error {
 	return nil
 }
 
-// Drop closes and deletes the LevelDB database of the prefix queue.
+// Drop closes and deletes the BadgerDB database of the prefix queue.
 func (pq *PrefixQueue) Drop() error {
 	if err := pq.Close(); err != nil {
 		return err
@@ -356,11 +398,31 @@ func (pq *PrefixQueue) Drop() error {
 	return os.RemoveAll(pq.DataDir)
 }
 
+// RunGC runs garbage collection on database and discard deleted data from value log
+func (pq *PrefixQueue) RunGC(discardRatio float64) error {
+	return pq.db.RunValueLogGC(discardRatio)
+}
+
 // getQueue gets the unique queue for the given prefix.
 func (pq *PrefixQueue) getQueue(prefix []byte) (*queue, error) {
 	// Try to get the queue gob value.
-	qval, err := pq.db.Get(generateKeyPrefixData(prefix), nil)
-	if err == errors.ErrNotFound {
+	var qval []byte
+	err := pq.db.View(func(txn *badger.Txn) error {
+		badgerItem, err := txn.Get(generateKeyPrefixData(prefix))
+		if err != nil {
+			return err
+		}
+
+		if returnedValue, err := badgerItem.ValueCopy(nil); err != nil {
+			return err
+		} else {
+			qval = returnedValue
+		}
+
+		return nil
+	})
+
+	if err == badger.ErrKeyNotFound {
 		return nil, ErrEmpty
 	} else if err != nil {
 		return nil, err
@@ -377,8 +439,23 @@ func (pq *PrefixQueue) getQueue(prefix []byte) (*queue, error) {
 // already exist, a new queue is created.
 func (pq *PrefixQueue) getOrCreateQueue(prefix []byte) (*queue, error) {
 	// Try to get the queue gob value.
-	qval, err := pq.db.Get(generateKeyPrefixData(prefix), nil)
-	if err == errors.ErrNotFound {
+	var qval []byte
+	err := pq.db.View(func(txn *badger.Txn) error {
+		badgerItem, err := txn.Get(generateKeyPrefixData(prefix))
+		if err != nil {
+			return err
+		}
+
+		if returnedValue, err := badgerItem.ValueCopy(nil); err != nil {
+			return err
+		} else {
+			qval = returnedValue
+		}
+
+		return nil
+	})
+
+	if err == badger.ErrKeyNotFound {
 		return &queue{}, nil
 	} else if err != nil {
 		return nil, err
@@ -401,14 +478,20 @@ func (pq *PrefixQueue) saveQueue(prefix []byte, q *queue) error {
 	}
 
 	// Save it to the database.
-	return pq.db.Put(generateKeyPrefixData(prefix), buffer.Bytes(), nil)
+	return pq.db.Update(func(txn *badger.Txn) error {
+		err := txn.Set(generateKeyPrefixData(prefix), buffer.Bytes())
+		return err
+	})
 }
 
 // save saves the main prefix queue data.
 func (pq *PrefixQueue) save() error {
 	val := make([]byte, 8)
 	binary.BigEndian.PutUint64(val, pq.size)
-	return pq.db.Put(pq.getDataKey(), val, nil)
+	return pq.db.Update(func(txn *badger.Txn) error {
+		err := txn.Set(pq.getDataKey(), val)
+		return err
+	})
 }
 
 // getDataKey generates the main prefix queue data key.
@@ -442,7 +525,20 @@ func (pq *PrefixQueue) getItemByPrefixID(prefix []byte, id uint64) (*Item, error
 		Key: generateKeyPrefixID(prefix, id),
 	}
 
-	if item.Value, err = pq.db.Get(item.Key, nil); err != nil {
+	if err = pq.db.View(func(txn *badger.Txn) error {
+		badgerItem, err := txn.Get(item.Key)
+		if err != nil {
+			return err
+		}
+
+		if returnedValue, err := badgerItem.ValueCopy(nil); err != nil {
+			return err
+		} else {
+			item.Value = returnedValue
+		}
+
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 
@@ -451,9 +547,25 @@ func (pq *PrefixQueue) getItemByPrefixID(prefix []byte, id uint64) (*Item, error
 
 // init initializes the prefix queue data.
 func (pq *PrefixQueue) init() error {
+	var val []byte
+
 	// Get the main prefix queue data.
-	val, err := pq.db.Get(pq.getDataKey(), nil)
-	if err == errors.ErrNotFound {
+	err := pq.db.View(func(txn *badger.Txn) error {
+		badgerItem, err := txn.Get(pq.getDataKey())
+		if err != nil {
+			return err
+		}
+
+		if returnedValue, err := badgerItem.ValueCopy(nil); err != nil {
+			return err
+		} else {
+			val = returnedValue
+		}
+
+		return nil
+	})
+
+	if err == badger.ErrKeyNotFound {
 		return nil
 	} else if err != nil {
 		return err

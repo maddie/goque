@@ -4,17 +4,18 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/json"
+	"fmt"
 	"os"
 	"sync"
 
-	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/dgraph-io/badger/v3"
 )
 
 // Stack is a standard LIFO (last in, first out) stack.
 type Stack struct {
 	sync.RWMutex
 	DataDir string
-	db      *leveldb.DB
+	db      *badger.DB
 	head    uint64
 	tail    uint64
 	isOpen  bool
@@ -28,20 +29,57 @@ func OpenStack(dataDir string) (*Stack, error) {
 	// Create a new Stack.
 	s := &Stack{
 		DataDir: dataDir,
-		db:      &leveldb.DB{},
+		db:      &badger.DB{},
 		head:    0,
 		tail:    0,
 		isOpen:  false,
 	}
 
 	// Open database for the stack.
-	s.db, err = leveldb.OpenFile(dataDir, nil)
+	opt := badger.DefaultOptions(dataDir)
+	opt = opt.WithValueLogFileSize(1 << 24)
+
+	s.db, err = badger.Open(opt)
 	if err != nil {
 		return s, err
 	}
 
 	// Check if this Goque type can open the requested data directory.
 	ok, err := checkGoqueType(dataDir, goqueStack)
+	if err != nil {
+		return s, err
+	}
+	if !ok {
+		return s, ErrIncompatibleType
+	}
+
+	// Set isOpen and return.
+	s.isOpen = true
+	return s, s.init()
+}
+
+// OpenStackWithOptions opens a stack th given BadgerDB options at the directory
+// defined within the options.. If onedoes not already exist, a new stack is created.
+func OpenStackWithOptions(options badger.Options) (*Stack, error) {
+	var err error
+
+	// Create a new Stack.
+	s := &Stack{
+		DataDir: options.Dir,
+		db:      &badger.DB{},
+		head:    0,
+		tail:    0,
+		isOpen:  false,
+	}
+
+	// Open database for the stack.
+	s.db, err = badger.Open(options)
+	if err != nil {
+		return s, err
+	}
+
+	// Check if this Goque type can open the requested data directory.
+	ok, err := checkGoqueType(options.Dir, goqueStack)
 	if err != nil {
 		return s, err
 	}
@@ -72,7 +110,10 @@ func (s *Stack) Push(value []byte) (*Item, error) {
 	}
 
 	// Add it to the stack.
-	if err := s.db.Put(item.Key, item.Value, nil); err != nil {
+	if err := s.db.Update(func(txn *badger.Txn) error {
+		err := txn.Set(item.Key, item.Value)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 
@@ -137,7 +178,9 @@ func (s *Stack) Pop() (*Item, error) {
 	}
 
 	// Remove this item from the stack.
-	if err := s.db.Delete(item.Key, nil); err != nil {
+	if err := s.db.Update(func(txn *badger.Txn) error {
+		return txn.Delete(item.Key)
+	}); err != nil {
 		return nil, err
 	}
 
@@ -210,7 +253,10 @@ func (s *Stack) Update(id uint64, newValue []byte) (*Item, error) {
 	}
 
 	// Update this item in the stack.
-	if err := s.db.Put(item.Key, item.Value, nil); err != nil {
+	if err := s.db.Update(func(txn *badger.Txn) error {
+		err := txn.Set(item.Key, item.Value)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 
@@ -292,6 +338,11 @@ func (s *Stack) Drop() error {
 	return os.RemoveAll(s.DataDir)
 }
 
+// RunGC runs garbage collection on database and discard deleted data from value log
+func (s *Stack) RunGC(discardRatio float64) error {
+	return s.db.RunValueLogGC(discardRatio)
+}
+
 // getItemByID returns an item, if found, for the given ID.
 func (s *Stack) getItemByID(id uint64) (*Item, error) {
 	// Check if empty or out of bounds.
@@ -304,7 +355,20 @@ func (s *Stack) getItemByID(id uint64) (*Item, error) {
 	// Get item from database.
 	var err error
 	item := &Item{ID: id, Key: idToKey(id)}
-	if item.Value, err = s.db.Get(item.Key, nil); err != nil {
+	if err = s.db.View(func(txn *badger.Txn) error {
+		badgerItem, err := txn.Get(item.Key)
+		if err != nil {
+			return err
+		}
+
+		if returnedValue, err := badgerItem.ValueCopy(nil); err != nil {
+			return err
+		} else {
+			item.Value = returnedValue
+		}
+
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 
@@ -313,19 +377,35 @@ func (s *Stack) getItemByID(id uint64) (*Item, error) {
 
 // init initializes the stack data.
 func (s *Stack) init() error {
-	// Create a new LevelDB Iterator.
-	iter := s.db.NewIterator(nil, nil)
-	defer iter.Release()
+	return s.db.View(func(txn *badger.Txn) error {
+		// Create a new BadgerDB Iterator.
+		opts := badger.DefaultIteratorOptions
+		it := txn.NewIterator(opts)
+		defer it.Close()
 
-	// Set stack head to the last item.
-	if iter.Last() {
-		s.head = keyToID(iter.Key())
-	}
+		if it.Rewind(); it.Valid() {
+			// Set stack tail to the first item.
+			s.tail = keyToID(it.Item().Key()) - 1
 
-	// Set stack tail to the first item.
-	if iter.First() {
-		s.tail = keyToID(iter.Key()) - 1
-	}
+			for {
+				if it.Next(); it.Valid() {
+					// Set stack head to the last item.
+					s.head = keyToID(it.Item().Key())
+				} else {
+					break
+				}
+			}
+		}
 
-	return iter.Error()
+		// reinitialize stack in case of database error
+		if s.tail > s.head {
+			s.tail = 0
+			s.head = 0
+			if err := s.db.DropAll(); err != nil {
+				fmt.Printf("error resetting database: %s", err)
+			}
+		}
+
+		return nil
+	})
 }
